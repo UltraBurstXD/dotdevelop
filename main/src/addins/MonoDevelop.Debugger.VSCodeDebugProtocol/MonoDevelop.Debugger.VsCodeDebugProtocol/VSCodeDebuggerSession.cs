@@ -23,20 +23,23 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
+
 using System;
-using Mono.Debugging.Client;
-using System.Diagnostics;
-using Mono.Debugging.Backend;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
 using System.IO;
+using System.Linq;
 using System.Text;
-using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using System.Collections.Generic;
+
+using Mono.Debugging.Client;
+
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol;
-using System.Threading;
+using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
+
 using MonoDevelop.Core;
 using MonoDevelop.Core.Execution;
+
 using MonoFunctionBreakpoint = Mono.Debugging.Client.FunctionBreakpoint;
 using VsCodeFunctionBreakpoint = Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.FunctionBreakpoint;
 
@@ -44,7 +47,22 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 {
 	public abstract class VSCodeDebuggerSession : DebuggerSession
 	{
+		readonly Dictionary<string, bool> enumTypes = new Dictionary<string, bool> ();
 		int currentThreadId;
+
+		internal bool IsEnum (string type, int frameId)
+		{
+			if (enumTypes.TryGetValue (type, out var isEnum))
+				return isEnum;
+
+			var request = new EvaluateRequest ($"typeof ({type}).IsEnum") { FrameId = frameId };
+			var response = protocolClient.SendRequestSync (request);
+
+			isEnum = response.Result.Equals ("true", StringComparison.OrdinalIgnoreCase);
+			enumTypes.Add (type, isEnum);
+
+			return isEnum;
+		}
 
 		protected override void OnContinue ()
 		{
@@ -156,6 +174,7 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 		}
 
 		bool currentExceptionState = false;
+		bool unhandleExceptionRegistered = false;
 		void UpdateExceptions ()
 		{
 			//Disposed
@@ -163,11 +182,13 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 				return;
 
 			var hasCustomExceptions = breakpoints.Select (b => b.Key).OfType<Catchpoint> ().Any (e => e.Enabled);
-			if (currentExceptionState != hasCustomExceptions) {
+			if (currentExceptionState != hasCustomExceptions || !unhandleExceptionRegistered) {
 				currentExceptionState = hasCustomExceptions;
-				protocolClient.SendRequest (new SetExceptionBreakpointsRequest (
-					Capabilities.ExceptionBreakpointFilters.Where (f => hasCustomExceptions || (f.Default ?? false)).Select (f => f.Filter).ToList ()
-				), null);
+				var exceptionRequest = new SetExceptionBreakpointsRequest (
+					Capabilities.ExceptionBreakpointFilters.Where (f => hasCustomExceptions || (f.Default ?? false)).Select (f => f.Filter).ToList ());
+				exceptionRequest.ExceptionOptions = new List<ExceptionOptions> () {new ExceptionOptions(ExceptionBreakMode.UserUnhandled)};
+				protocolClient.SendRequest (exceptionRequest, null);
+				unhandleExceptionRegistered = true;
 			}
 		}
 
@@ -227,7 +248,7 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 			startInfo.StandardOutputEncoding = Encoding.UTF8;
 			startInfo.StandardOutputEncoding = Encoding.UTF8;
 			startInfo.UseShellExecute = false;
-			if (!MonoDevelop.Core.Platform.IsWindows)
+			if (!Platform.IsWindows)
 				startInfo.EnvironmentVariables ["PATH"] = Environment.GetEnvironmentVariable ("PATH") + ":/usr/local/share/dotnet/";
 			debugAgentProcess = Process.Start (startInfo);
 			debugAgentProcess.EnableRaisingEvents = true;
@@ -236,7 +257,7 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 			protocolClient.RequestReceived += OnDebugAdaptorRequestReceived;
 			protocolClient.Run ();
 			protocolClient.EventReceived += HandleEvent;
-			InitializeRequest initRequest = CreateInitRequest ();
+			var initRequest = CreateInitRequest ();
 			Capabilities = protocolClient.SendRequestSync (initRequest);
 		}
 
@@ -265,9 +286,10 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 		{
 			pauseWhenFinished = !startInfo.CloseExternalConsoleOnExit;
 			StartDebugAgent ();
-			LaunchRequest launchRequest = CreateLaunchRequest (startInfo);
+			var launchRequest = CreateLaunchRequest (startInfo);
 			protocolClient.SendRequestSync (launchRequest);
 			protocolClient.SendRequestSync (new ConfigurationDoneRequest ());
+			UpdateExceptions ();
 		}
 
 		protected void Attach (long processId)
@@ -277,6 +299,7 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 			protocolClient.SendRequestSync (attachRequest);
 			OnStarted ();
 			protocolClient.SendRequestSync (new ConfigurationDoneRequest ());
+			UpdateExceptions ();
 		}
 
 		protected internal DebugProtocolHost protocolClient;
@@ -316,7 +339,7 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 
 		bool? EvaluateCondition (int frameId, string exp)
 		{
-			var response = protocolClient.SendRequestSync (new EvaluateRequest (exp, frameId)).Result;
+			var response = protocolClient.SendRequestSync (new EvaluateRequest (exp) { FrameId = frameId }).Result;
 
 			if (bool.TryParse (response, out var result))
 				return result;
@@ -346,6 +369,7 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 
 			return string.IsNullOrWhiteSpace (catchpoint.ConditionExpression) || EvaluateCondition (frameId, catchpoint.ConditionExpression) != false;
 		}
+
 
 		protected void HandleEvent (object sender, EventReceivedEventArgs obj)
 		{
@@ -403,12 +427,16 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 							// It's OK to evaluate expressions in external code
 							stackFrame = (VsCodeStackFrame)backtrace.GetFrame (0);
 						}
-
-						if (!breakpoints.Select (b => b.Key).OfType<Catchpoint> ().Any (c => ShouldStopOnExceptionCatchpoint (c, stackFrame.frameId))) {
-							OnContinue ();
-							return;
+						var response = protocolClient.SendRequestSync (new ExceptionInfoRequest (body.ThreadId ?? -1));
+						if (response.BreakMode.Equals (ExceptionBreakMode.UserUnhandled)) {
+							args = new TargetEventArgs (TargetEventType.UnhandledException);
+						} else {
+							if (!breakpoints.Select (b => b.Key).OfType<Catchpoint> ().Any (c => ShouldStopOnExceptionCatchpoint (c, stackFrame.frameId))) {
+								OnContinue ();
+								return;
+							}
+							args = new TargetEventArgs (TargetEventType.ExceptionThrown);
 						}
-						args = new TargetEventArgs (TargetEventType.ExceptionThrown);
 						break;
 					default:
 						throw new NotImplementedException (body.Reason.ToString ());
@@ -455,7 +483,7 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 					}
 					break;
 				}
-			});
+			}).Ignore ();
 		}
 
 		List<string> pathsWithBreakpoints = new List<string> ();
@@ -516,7 +544,7 @@ namespace MonoDevelop.Debugger.VsCodeDebugProtocol
 								if (obj.Breakpoints [i].Line != sourceFile.ElementAt (i).OriginalLine)
 									breakpoints [sourceFile.ElementAt (i)].AdjustBreakpointLocation (obj.Breakpoints [i].Line, obj.Breakpoints [i].Column ?? 1);
 							}
-						});
+						}).Ignore ();
 					});
 			}
 
